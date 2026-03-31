@@ -1,0 +1,11 @@
+ 
+streamlit
+pymupdf
+sentence-transformers
+faiss-cpu
+numpy
+google-generativeai
+requests
+Pillow
+pytesseract
+python-dotenv

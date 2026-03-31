@@ -1,0 +1,6 @@
+notepad packages.txt
+```
+
+Notepad will open → paste this:
+```
+tesseract-ocr

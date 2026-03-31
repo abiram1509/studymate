@@ -1,0 +1,8 @@
+notepad .gitignore
+```
+
+Paste this inside and save:
+```
+.env
+__pycache__/
+*.pyc
