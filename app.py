@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+st.set_page_config(page_title="StudyMate", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
+
 # --- Rate Limiter ---
 
 
@@ -42,6 +44,12 @@ limiter = RateLimiter(8, 60)
 def safe_generate(model, prompt):
     limiter.wait()
     return model.generate_content(prompt)
+
+
+@st.cache_resource
+def get_sentence_embedder():
+    # Use a smaller model for faster startup and reduced memory usage
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
 
 # --- Initialize API ---
@@ -176,7 +184,7 @@ with tab1:
             if not chunks:
                 st.error("PDF is empty or could not be processed.")
             else:
-                embedder = SentenceTransformer("paraphrase-MiniLM-L3-v2")
+                embedder = get_sentence_embedder()
                 embeddings = embedder.encode(chunks)
                 embeddings = np.array(embeddings)
                 if embeddings.ndim == 1:
