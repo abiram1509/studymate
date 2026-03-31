@@ -4,7 +4,6 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import google.generativeai as genai
-import requests
 from PIL import Image
 from io import BytesIO
 import os
@@ -16,6 +15,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 st.set_page_config(page_title="StudyMate", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
+# limit max upload size to reduce memory pressure in low-RAM hosts like Render free tier
+st.set_option('server.maxUploadSize', 10)
 
 # --- Rate Limiter ---
 
@@ -50,6 +51,32 @@ def safe_generate(model, prompt):
 def get_sentence_embedder():
     # Use a smaller model for faster startup and reduced memory usage
     return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+@st.cache_data(max_entries=4, ttl=3600)
+def process_pdf_text(file_bytes):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    text = ""
+    for page in doc:
+        page_text = page.get_text()
+        if page_text.strip():
+            text += page_text
+        else:
+            pix = page.get_pixmap()
+            img = Image.open(BytesIO(pix.tobytes()))
+            ocr_text = pytesseract.image_to_string(img)
+            text += ocr_text
+    doc.close()
+    return text
+
+
+@st.cache_data(max_entries=4, ttl=3600)
+def get_chunks_from_text(text):
+    words = text.split()
+    # avoid huge in-memory embeddings by limiting text max size
+    if len(words) > 5000:
+        words = words[:5000]
+    return [" ".join(words[i:i+500]) for i in range(0, len(words), 300)]
 
 
 # --- Initialize API ---
@@ -131,114 +158,88 @@ if "pdf_history" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-tab1, tab2, tab3 = st.tabs(
+tab1, tab2 = st.tabs(
     [
         "📄 PDF Q&A",
-        "💬 General Chatbot",
-        "🕶️ Text-to-Image"
+        "💬 General Chatbot"
     ]
 )
-
-
-def generate_image_colab(prompt, negative_prompt, api_url):
-    data = {"prompt": prompt, "negative_prompt": negative_prompt}
-    response = requests.post(api_url + "/generate", json=data)
-    if response.status_code == 200:
-        return Image.open(BytesIO(response.content))
-    else:
-        return None
 
 
 with tab1:
     uploaded_files = st.file_uploader(
         "", type="pdf", accept_multiple_files=True)
-    pdf_texts = []
-    pdf_names = []
 
     if uploaded_files:
+        if len(uploaded_files) > 1:
+            st.warning("Only the first PDF is processed to save memory on low-RAM hosts.")
+            uploaded_files = uploaded_files[:1]
+
         try:
-            for uploaded_file in uploaded_files:
-                doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-                text = ""
-                for page in doc:
-                    page_text = page.get_text()
-                    if page_text.strip():
-                        text += page_text
-                    else:
-                        # If no text found, try OCR on the page image
-                        pix = page.get_pixmap()
-                        img = Image.open(BytesIO(pix.tobytes()))
-                        # Uncomment and set the path below if needed:
-                        # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-                        ocr_text = pytesseract.image_to_string(img)
-                        text += ocr_text
-                pdf_texts.append(text)
-                pdf_names.append(uploaded_file.name)
-            st.markdown("### Select PDF to query:")
-            selected_pdf = st.selectbox("", pdf_names)
-            selected_index = pdf_names.index(selected_pdf)
-            selected_text = pdf_texts[selected_index]
-
-            words = selected_text.split()
-            chunks = [" ".join(words[i:i+500]) for i in range(0, len(words), 300)]
-            if not chunks:
-                st.error("PDF is empty or could not be processed.")
+            uploaded_file = uploaded_files[0]
+            if uploaded_file.size > 5 * 1024 * 1024:
+                st.error("Please upload a PDF smaller than 5MB for Render free tier.")
             else:
-                embedder = get_sentence_embedder()
-                embeddings = embedder.encode(chunks)
-                embeddings = np.array(embeddings)
-                if embeddings.ndim == 1:
-                    embeddings = embeddings.reshape(1, -1)
-                dimension = embeddings.shape[1]
-                index = faiss.IndexFlatL2(dimension)
-                index.add(embeddings)
+                selected_text = process_pdf_text(uploaded_file.read())
+                chunks = get_chunks_from_text(selected_text)
 
-                st.markdown("### Ask a question from your selected PDF:")
-                question = st.text_area("", key="pdf_question")
-                if question:
-                    question_embedding = embedder.encode([question])
-                    question_embedding = np.array(question_embedding)
-                    if question_embedding.ndim == 1:
-                        question_embedding = question_embedding.reshape(1, -1)
-                    if question_embedding.shape[1] != dimension:
-                        st.error(
-                            "Embedding dimension mismatch. Please check your PDF or question.")
-                    else:
-                        D, I = index.search(question_embedding,
-                                            k=min(3, len(chunks)))
-                        retrieved_chunks = [chunks[i] for i in I[0]]
-                        context = "\n".join(retrieved_chunks)
+                if not chunks:
+                    st.error("PDF is empty or could not be processed.")
+                else:
+                    embedder = get_sentence_embedder()
 
-                        # LLM answer generation (Gemini) - Using rate limiter
-                        model = genai.GenerativeModel("gemini-2.5-flash")
-                        prompt = f"""You are a helpful academic assistant.
-                        Use the following context extracted from the student's PDF to answer the question accurately.
-                        If the answer is not found in the context, clearly say: "This information is not available in the uploaded PDF."
-                        Context:
-                       {context}
-                       Question: {question}
-                       Answer in a clear, structured way:"""
-                        with st.spinner("Generating answer..."):
-                            response = safe_generate(model, prompt)
-                        st.success("🎯 **Answer:**")
-                        st.markdown(
-                            f"<div style='background-color:rgb(0,0,0);padding:10px;border-radius:8px;color:rgb(255,255,255);'>{response.text}</div>", unsafe_allow_html=True)
+                    with st.spinner("Embedding PDF text..."):
+                        embeddings = embedder.encode(chunks)
 
-                        # Add to PDF Q&A history
-                        st.session_state.pdf_history.append(
-                            (question, response.text))
+                    embeddings = np.array(embeddings)
+                    if embeddings.ndim == 1:
+                        embeddings = embeddings.reshape(1, -1)
+                    dimension = embeddings.shape[1]
+                    index = faiss.IndexFlatL2(dimension)
+                    index.add(embeddings)
 
-                        # Download button for answer
-                        st.download_button(
-                            "Download Answer", response.text, file_name="pdf_answer.txt")
+                    st.markdown("### Ask a question from your uploaded PDF:")
+                    question = st.text_area("", key="pdf_question")
+                    if question:
+                        question_embedding = embedder.encode([question])
+                        question_embedding = np.array(question_embedding)
+                        if question_embedding.ndim == 1:
+                            question_embedding = question_embedding.reshape(1, -1)
+                        if question_embedding.shape[1] != dimension:
+                            st.error(
+                                "Embedding dimension mismatch. Please check your PDF or question.")
+                        else:
+                            D, I = index.search(question_embedding,
+                                                k=min(3, len(chunks)))
+                            retrieved_chunks = [chunks[i] for i in I[0]]
+                            context = "\n".join(retrieved_chunks)
 
-                # Show PDF Q&A history
-                if st.session_state.pdf_history:
-                    st.markdown("#### Q&A History")
-                    for q, a in st.session_state.pdf_history:
-                        st.markdown(f"<b>Q:</b> {q}", unsafe_allow_html=True)
-                        st.markdown(f"<b>A:</b> {a}", unsafe_allow_html=True)
-                        st.markdown("---")
+                            model = genai.GenerativeModel("gemini-2.5-flash")
+                            prompt = f"""You are a helpful academic assistant.
+                            Use the following context extracted from the student's PDF to answer the question accurately.
+                            If the answer is not found in the context, clearly say: "This information is not available in the uploaded PDF."
+                            Context:
+                           {context}
+                           Question: {question}
+                           Answer in a clear, structured way:"""
+                            with st.spinner("Generating answer..."):
+                                response = safe_generate(model, prompt)
+                            st.success("🎯 **Answer:**")
+                            st.markdown(
+                                f"<div style='background-color:rgb(0,0,0);padding:10px;border-radius:8px;color:rgb(255,255,255);'>{response.text}</div>", unsafe_allow_html=True)
+
+                            st.session_state.pdf_history.append(
+                                (question, response.text))
+
+                            st.download_button(
+                                "Download Answer", response.text, file_name="pdf_answer.txt")
+
+                    if st.session_state.pdf_history:
+                        st.markdown("#### Q&A History")
+                        for q, a in st.session_state.pdf_history:
+                            st.markdown(f"<b>Q:</b> {q}", unsafe_allow_html=True)
+                            st.markdown(f"<b>A:</b> {a}", unsafe_allow_html=True)
+                            st.markdown("---")
         except Exception as e:
             st.error(f"An error occurred while processing the PDF: {e}")
 
@@ -270,28 +271,4 @@ with tab2:
             st.markdown(f"<b>Bot:</b> {a}", unsafe_allow_html=True)
             st.markdown("---")
 
-with tab3:
-    st.markdown("<h1 style='text-align: center; color: #6C63FF;'>🕶️ High-Fashion Portrait Generator</h1>",
-                unsafe_allow_html=True)
-    st.divider()
-    prompt = st.text_input("Enter your image prompt:")
-    negative_prompt = st.text_input(
-        "Enter negative prompt (optional):", value="")
 
-    # Set your Colab ngrok API URL here
-    api_url = st.text_input(
-        "Colab API URL (e.g., http://xxxx-xx-xx-xx-xx.ngrok-free.app)")
-
-    if st.button("✨ Generate Portrait", key="portrait_button"):
-        try:
-            with st.spinner("🧠 Crafting your high-fashion masterpiece..."):
-                image = generate_image_colab(prompt, negative_prompt, api_url)
-                if image:
-                    st.image(image, caption="🎨 Your Generated Portrait",
-                             use_column_width=True)
-                    image.save("chroma.png")
-                    st.success("✅ Portrait generated and saved as chroma.png!")
-                else:
-                    st.error("Failed to generate image from Colab API.")
-        except Exception as e:
-            st.error(f"An error occurred while generating the image: {e}")
